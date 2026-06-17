@@ -13,6 +13,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 )
 
@@ -22,6 +23,7 @@ type Pan115 struct {
 	client     *driver115.Pan115Client
 	limiter    *rate.Limiter
 	appVerOnce sync.Once
+	transfer   *subTransferManager
 }
 
 func (d *Pan115) Config() driver.Config {
@@ -37,7 +39,15 @@ func (d *Pan115) Init(ctx context.Context) error {
 	if d.LimitRate > 0 {
 		d.limiter = rate.NewLimiter(rate.Limit(d.LimitRate), 1)
 	}
-	return d.login()
+	if err := d.login(); err != nil {
+		return err
+	}
+	transfer, err := d.newSubTransferManager()
+	if err != nil {
+		return err
+	}
+	d.transfer = transfer
+	return nil
 }
 
 func (d *Pan115) WaitLimit(ctx context.Context) error {
@@ -72,7 +82,45 @@ func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 	if userAgent == "" {
 		userAgent = base.UserAgent
 	}
-	downloadInfo, err := d.client.DownloadWithUA(file.(*FileObj).PickCode, userAgent)
+	fileObj, ok := file.(*FileObj)
+	if !ok {
+		return nil, errors.New("can't convert file object")
+	}
+	if d.transfer != nil {
+		skipped := make(map[*subAccount]struct{})
+		var subErr error
+		for {
+			result, err := d.transfer.prepare(ctx, fileObj, userAgent, skipped)
+			if err != nil {
+				subErr = err
+				break
+			}
+			downloadInfo, err := result.client.DownloadWithUA(result.pickCode, userAgent)
+			if err == nil {
+				return &model.Link{
+					URL:    downloadInfo.Url.Url,
+					Header: downloadInfo.Header,
+				}, nil
+			}
+			subErr = err
+			if result.account != nil {
+				skipped[result.account] = struct{}{}
+				d.transfer.markUnavailableIfNeeded(result.account, err)
+				log.Warnf("[115-Sub] download with sub account failed: account=%d file=%q id=%s err=%v", result.account.index, fileObj.GetName(), fileObj.GetID(), err)
+			}
+			if len(skipped) >= d.transfer.accountCount() {
+				break
+			}
+		}
+		if subErr == nil {
+			subErr = errors.New("no 115 sub account available")
+		}
+		if !d.SubFallbackToMain {
+			return nil, subErr
+		}
+		log.Warnf("[115-Sub] all sub accounts failed, fallback to main account: file=%q id=%s err=%v", fileObj.GetName(), fileObj.GetID(), subErr)
+	}
+	downloadInfo, err := d.client.DownloadWithUA(fileObj.PickCode, userAgent)
 	if err != nil {
 		return nil, err
 	}

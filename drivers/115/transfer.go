@@ -30,7 +30,6 @@ import (
 )
 
 const (
-	defaultSubTransferCacheExpire = 2 * time.Hour
 	maxRapidUploadVerifyAttempts  = 3
 	subAccountUnavailableDuration = 10 * time.Minute
 )
@@ -38,7 +37,6 @@ const (
 type subTransferManager struct {
 	main     *Pan115
 	accounts []*subAccount
-	cacheTTL time.Duration
 	cache    map[string]subTransferCacheEntry
 	mu       sync.Mutex
 	group    singleflight.Group[*subTransferResult]
@@ -52,6 +50,8 @@ type subAccount struct {
 	mu               sync.Mutex
 	stateMu          sync.Mutex
 	unavailableUntil time.Time
+	lastError        string
+	lastErrorAt      time.Time
 }
 
 type subTransferCacheEntry struct {
@@ -63,6 +63,10 @@ type subTransferResult struct {
 	client   *driver115.Pan115Client
 	account  *subAccount
 	pickCode string
+	file      *FileObj
+	userAgent string
+	fileID    string
+	fileName  string
 }
 
 type subHTTPStatusError struct {
@@ -104,27 +108,45 @@ func (d *Pan115) newSubTransferManager() (*subTransferManager, error) {
 	if rootDir == "" {
 		rootDir = "tmp"
 	}
-	cacheTTL := defaultSubTransferCacheExpire
-	if d.SubTransferCacheExpire > 0 {
-		cacheTTL = time.Duration(d.SubTransferCacheExpire) * time.Second
-	}
 	m := &subTransferManager{
 		main:     d,
-		cacheTTL: cacheTTL,
 		cache:    make(map[string]subTransferCacheEntry),
 	}
 	for i, cookie := range cookies {
 		client, err := d.newClientByCookie(cookie)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to login 115 sub account %d", i+1)
+			if d.runtime != nil {
+				d.runtime.recordSubLogin(i+1, err)
+			}
+			m.accounts = append(m.accounts, &subAccount{
+				index:       i + 1,
+				rootDir:     rootDir,
+				lastError:   err.Error(),
+				lastErrorAt: time.Now(),
+			})
+			continue
 		}
-		m.accounts = append(m.accounts, &subAccount{
+		account := &subAccount{
 			index:   i + 1,
 			client:  client,
 			rootDir: rootDir,
-		})
+		}
+		m.accounts = append(m.accounts, account)
+		if d.runtime != nil {
+			d.runtime.recordSubLogin(i+1, nil)
+			d.runtime.recordSubState(account)
+		}
 	}
-	log.Infof("[115-Sub] sub-account transfer enabled: accounts=%d dir=%q cache=%s", len(m.accounts), rootDir, cacheTTL)
+	usable := 0
+	for _, account := range m.accounts {
+		if account != nil && account.client != nil {
+			usable++
+		}
+	}
+	log.Infof("[115-Sub] sub-account transfer enabled: accounts=%d usable=%d dir=%q", len(m.accounts), usable, rootDir)
+	if usable == 0 && !d.SubFallbackToMain {
+		return m, errors.New("no usable 115 sub account available")
+	}
 	return m, nil
 }
 
@@ -189,13 +211,25 @@ func (m *subTransferManager) prepare(ctx context.Context, file *FileObj, userAge
 		}
 		var lastErr error
 		for _, account := range accounts {
+			if account.client == nil {
+				lastErr = errors.New("sub account login failed")
+				continue
+			}
 			result, err := m.prepareWithAccount(ctx, account, file)
 			if err == nil {
+				result.file = file
+				result.userAgent = userAgent
 				m.setCache(key, result)
+				if m.main.runtime != nil {
+					m.main.runtime.recordTransferResult(file, account, result, userAgent, "transfer_prepare")
+				}
 				log.Infof("[115-Sub] prepared sub file: account=%d file=%q id=%s", account.index, file.GetName(), file.GetID())
 				return result, nil
 			}
 			lastErr = err
+			if m.main.runtime != nil {
+				m.main.runtime.recordSubError(account, "prepare", err)
+			}
 			m.markUnavailableIfNeeded(account, err)
 			log.Warnf("[115-Sub] prepare with sub account failed: account=%d file=%q id=%s err=%v", account.index, file.GetName(), file.GetID(), err)
 		}
@@ -250,7 +284,20 @@ func (m *subTransferManager) setCache(key string, result *subTransferResult) {
 	defer m.mu.Unlock()
 	m.cache[key] = subTransferCacheEntry{
 		result:    result,
-		expiresAt: time.Now().Add(m.cacheTTL),
+		expiresAt: time.Now().Add(2 * time.Hour),
+	}
+}
+
+func (m *subTransferManager) invalidateResult(file *FileObj, result *subTransferResult) {
+	if file == nil {
+		return
+	}
+	key := m.cacheKey(file)
+	m.mu.Lock()
+	delete(m.cache, key)
+	m.mu.Unlock()
+	if m.main.runtime != nil {
+		m.main.runtime.deleteTransferByResult(result)
 	}
 }
 
@@ -295,6 +342,10 @@ func (account *subAccount) markUnavailable(duration time.Duration, err error) ti
 	if until.After(account.unavailableUntil) {
 		account.unavailableUntil = until
 	}
+	if err != nil {
+		account.lastError = err.Error()
+		account.lastErrorAt = time.Now()
+	}
 	return account.unavailableUntil
 }
 
@@ -337,6 +388,13 @@ func isSubAccountUnavailableError(err error) bool {
 		return isSubAccountUnavailableStatus(statusErr.statusCode)
 	}
 	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "pickcode does not exist") ||
+		strings.Contains(msg, "empty pickcode") ||
+		strings.Contains(msg, "target does not exist") ||
+		strings.Contains(msg, "can not get download url") ||
+		strings.Contains(msg, "can not download directory") {
+		return false
+	}
 	return strings.Contains(msg, "403") ||
 		strings.Contains(msg, "forbidden") ||
 		strings.Contains(msg, "405") ||
@@ -349,6 +407,24 @@ func isSubAccountUnavailableStatus(statusCode int) bool {
 	return statusCode == http.StatusForbidden ||
 		statusCode == http.StatusMethodNotAllowed ||
 		statusCode == http.StatusTooManyRequests
+}
+
+func (m *subTransferManager) shouldInvalidateAndRetry(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, driver115.ErrPickCodeNotExist) ||
+		errors.Is(err, driver115.ErrPickCodeIsEmpty) ||
+		errors.Is(err, driver115.ErrNotExist) ||
+		errors.Is(err, driver115.ErrDownloadEmpty) ||
+		errors.Is(err, driver115.ErrDownloadFileNotExistOrHasDeleted) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "pickcode does not exist") ||
+		strings.Contains(msg, "empty pickcode") ||
+		strings.Contains(msg, "target file does not exist or has deleted") ||
+		strings.Contains(msg, "target does not exist")
 }
 
 func (m *subTransferManager) prepareWithAccount(ctx context.Context, account *subAccount, file *FileObj) (*subTransferResult, error) {
@@ -365,7 +441,7 @@ func (m *subTransferManager) prepareWithAccount(ctx context.Context, account *su
 	}
 	if existing != nil && existing.PickCode != "" {
 		log.Infof("[115-Sub] reuse existing sub file: dir=%s name=%q", rootID, name)
-		return &subTransferResult{client: account.client, account: account, pickCode: existing.PickCode}, nil
+		return &subTransferResult{client: account.client, account: account, pickCode: existing.PickCode, file: file, fileID: existing.FileID, fileName: existing.Name}, nil
 	}
 	if file.PickCode == "" {
 		return nil, errors.New("source file has no pickcode")
@@ -382,7 +458,7 @@ func (m *subTransferManager) prepareWithAccount(ctx context.Context, account *su
 	}
 	if meta != nil && meta.PickCode != "" {
 		log.Infof("[115-Sub] rapid upload succeeded: dir=%s name=%q", rootID, name)
-		return &subTransferResult{client: account.client, account: account, pickCode: meta.PickCode}, nil
+		return &subTransferResult{client: account.client, account: account, pickCode: meta.PickCode, file: file, fileID: meta.FileID, fileName: name}, nil
 	}
 	created, err := findSubFile(account.client, rootID, name, strings.ToUpper(file.Sha1), file.GetSize())
 	if err != nil {
@@ -391,7 +467,7 @@ func (m *subTransferManager) prepareWithAccount(ctx context.Context, account *su
 	if created == nil || created.PickCode == "" {
 		return nil, errors.New("sub-account transfer succeeded but file metadata was not visible")
 	}
-	return &subTransferResult{client: account.client, account: account, pickCode: created.PickCode}, nil
+	return &subTransferResult{client: account.client, account: account, pickCode: created.PickCode, file: file, fileID: created.FileID, fileName: created.Name}, nil
 }
 
 func (m *subTransferManager) ensureRoot(ctx context.Context, account *subAccount) (string, error) {

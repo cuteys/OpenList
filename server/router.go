@@ -147,6 +147,7 @@ func admin(g *gin.RouterGroup) {
 	driver.GET("/list", handles.ListDriverInfo)
 	driver.GET("/names", handles.ListDriverNames)
 	driver.GET("/info", handles.GetDriverInfo)
+	driver.GET("/115/runtime", handles.Get115Runtime)
 
 	setting := g.Group("/setting")
 	setting.GET("/get", handles.GetSetting)

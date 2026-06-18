@@ -5,6 +5,15 @@ import (
 	"time"
 )
 
+type TypedCacheSnapshotEntry[T any] struct {
+	Key          string
+	TypeKey      string
+	Value        T
+	CreatedAt    *time.Time
+	LastAccessAt *time.Time
+	ExpiresAt    *time.Time
+}
+
 type TypedCache[T any] struct {
 	entries map[string]map[string]*CacheEntry[T]
 	mu      sync.RWMutex
@@ -37,7 +46,10 @@ func (c *TypedCache[T]) SetTypeWithExpirable(key, typeKey string, value T, exp E
 		c.entries[key] = cache
 	}
 
+	now := time.Now()
 	cache[typeKey] = &CacheEntry[T]{
+		CreatedAt:    now,
+		LastAccessAt: now,
 		data:      value,
 		Expirable: exp,
 	}
@@ -59,6 +71,11 @@ func (c *TypedCache[T]) GetType(key, typeKey string) (T, bool) {
 	c.mu.RUnlock()
 
 	if !expired {
+		c.mu.Lock()
+		if current := cache[typeKey]; current == entry {
+			current.LastAccessAt = time.Now()
+		}
+		c.mu.Unlock()
 		return entry.data, true
 	}
 
@@ -73,6 +90,21 @@ func (c *TypedCache[T]) GetType(key, typeKey string) (T, bool) {
 	}
 	c.mu.Unlock()
 	return *new(T), false
+}
+
+func (c *TypedCache[T]) TouchType(key, typeKey string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cache, exists := c.entries[key]
+	if !exists {
+		return false
+	}
+	entry, exists := cache[typeKey]
+	if !exists || entry == nil || entry.Expired() {
+		return false
+	}
+	entry.LastAccessAt = time.Now()
+	return true
 }
 
 func (c *TypedCache[T]) DeleteKey(key string) {
@@ -110,4 +142,61 @@ func (c *TypedCache[T]) GC() {
 			delete(c.entries, tk)
 		}
 	}
+}
+
+func (c *TypedCache[T]) SnapshotEntries() []TypedCacheSnapshotEntry[T] {
+	c.mu.RLock()
+	snapshots := make([]TypedCacheSnapshotEntry[T], 0)
+	expiredKeys := make(map[string][]string)
+	for key, entries := range c.entries {
+		for typeKey, entry := range entries {
+			if entry == nil {
+				continue
+			}
+			if entry.Expired() {
+				expiredKeys[key] = append(expiredKeys[key], typeKey)
+				continue
+			}
+			var expiresAt *time.Time
+			if exp, ok := entry.Expirable.(ExpirationTime); ok {
+				t := time.Time(exp)
+				expiresAt = &t
+			}
+			createdAt := entry.CreatedAt
+			lastAccessAt := entry.LastAccessAt
+			snapshots = append(snapshots, TypedCacheSnapshotEntry[T]{
+				Key:          key,
+				TypeKey:      typeKey,
+				Value:        entry.data,
+				CreatedAt:    &createdAt,
+				LastAccessAt: &lastAccessAt,
+				ExpiresAt:    expiresAt,
+			})
+		}
+	}
+	c.mu.RUnlock()
+
+	if len(expiredKeys) == 0 {
+		return snapshots
+	}
+
+	c.mu.Lock()
+	for key, typeKeys := range expiredKeys {
+		entries, ok := c.entries[key]
+		if !ok {
+			continue
+		}
+		for _, typeKey := range typeKeys {
+			entry, exists := entries[typeKey]
+			if !exists || entry == nil || !entry.Expired() {
+				continue
+			}
+			delete(entries, typeKey)
+		}
+		if len(entries) == 0 {
+			delete(c.entries, key)
+		}
+	}
+	c.mu.Unlock()
+	return snapshots
 }

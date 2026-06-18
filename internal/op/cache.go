@@ -11,6 +11,16 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
+type LinkCacheSnapshotEntry struct {
+	Key          string
+	TypeKey      string
+	Link         *model.Link
+	Obj          model.Obj
+	CreatedAt    *time.Time
+	LastAccessAt *time.Time
+	ExpiresAt    *time.Time
+}
+
 type CacheManager struct {
 	dirCache     *cache.KeyedCache[*directoryCache]       // Cache for directory listings
 	linkCache    *cache.TypedCache[*objWithLink]          // Cache for file links
@@ -151,6 +161,26 @@ func (cm *CacheManager) ClearAll() {
 	cm.userCache.Clear()
 	cm.settingCache.Clear()
 	cm.detailCache.Clear()
+}
+
+func (cm *CacheManager) SnapshotLinkCache() []LinkCacheSnapshotEntry {
+	entries := cm.linkCache.SnapshotEntries()
+	ret := make([]LinkCacheSnapshotEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Value == nil {
+			continue
+		}
+		ret = append(ret, LinkCacheSnapshotEntry{
+			Key:          entry.Key,
+			TypeKey:      entry.TypeKey,
+			Link:         entry.Value.link,
+			Obj:          entry.Value.obj,
+			CreatedAt:    entry.CreatedAt,
+			LastAccessAt: entry.LastAccessAt,
+			ExpiresAt:    entry.ExpiresAt,
+		})
+	}
+	return ret
 }
 
 type directoryCache struct {

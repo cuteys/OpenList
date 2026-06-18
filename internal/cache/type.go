@@ -15,4 +15,6 @@ func (e ExpirationTime) Expired() bool {
 type CacheEntry[T any] struct {
 	Expirable
 	data T
+	CreatedAt    time.Time
+	LastAccessAt time.Time
 }

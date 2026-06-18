@@ -24,6 +24,8 @@ type Pan115 struct {
 	limiter    *rate.Limiter
 	appVerOnce sync.Once
 	transfer   *subTransferManager
+	runtime    *driverRuntimeState
+	cleanupCancel context.CancelFunc
 }
 
 func (d *Pan115) Config() driver.Config {
@@ -36,17 +38,21 @@ func (d *Pan115) GetAddition() driver.Additional {
 
 func (d *Pan115) Init(ctx context.Context) error {
 	d.appVerOnce.Do(d.initAppVer)
+	d.stopCleanup()
+	if d.runtime == nil {
+		d.runtime = newDriverRuntimeState(d)
+	} else {
+		d.runtime.reset()
+	}
 	if d.LimitRate > 0 {
 		d.limiter = rate.NewLimiter(rate.Limit(d.LimitRate), 1)
 	}
 	if err := d.login(); err != nil {
 		return err
 	}
-	transfer, err := d.newSubTransferManager()
-	if err != nil {
-		return err
-	}
+	transfer, _ := d.newSubTransferManager()
 	d.transfer = transfer
+	d.startCleanup()
 	return nil
 }
 
@@ -58,6 +64,8 @@ func (d *Pan115) WaitLimit(ctx context.Context) error {
 }
 
 func (d *Pan115) Drop(ctx context.Context) error {
+	d.stopCleanup()
+	d.transfer = nil
 	return nil
 }
 
@@ -97,6 +105,10 @@ func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 			}
 			downloadInfo, err := result.client.DownloadWithUA(result.pickCode, userAgent)
 			if err == nil {
+				if d.runtime != nil {
+					d.runtime.recordTransferLinkUse(result.account)
+					d.runtime.touchTransfer(fileObj, userAgent)
+				}
 				return &model.Link{
 					URL:    downloadInfo.Url.Url,
 					Header: downloadInfo.Header,
@@ -104,8 +116,19 @@ func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 			}
 			subErr = err
 			if result.account != nil {
+				if d.runtime != nil {
+					d.runtime.recordSubError(result.account, "sub_download", err)
+				}
+				if d.transfer.shouldInvalidateAndRetry(err) {
+					d.transfer.invalidateResult(fileObj, result)
+					log.Warnf("[115-Sub] sub file missing, invalidate cached mapping and retry: account=%d file=%q id=%s err=%v", result.account.index, fileObj.GetName(), fileObj.GetID(), err)
+					continue
+				}
 				skipped[result.account] = struct{}{}
 				d.transfer.markUnavailableIfNeeded(result.account, err)
+				if d.runtime != nil {
+					d.runtime.recordSubState(result.account)
+				}
 				log.Warnf("[115-Sub] download with sub account failed: account=%d file=%q id=%s err=%v", result.account.index, fileObj.GetName(), fileObj.GetID(), err)
 			}
 			if len(skipped) >= d.transfer.accountCount() {
@@ -119,6 +142,8 @@ func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 			return nil, subErr
 		}
 		log.Warnf("[115-Sub] all sub accounts failed, fallback to main account: file=%q id=%s err=%v", fileObj.GetName(), fileObj.GetID(), subErr)
+	} else if d.SubTransferEnabled && !d.SubFallbackToMain {
+		return nil, errors.New("115 sub transfer enabled but no usable sub account available")
 	}
 	downloadInfo, err := d.client.DownloadWithUA(fileObj.PickCode, userAgent)
 	if err != nil {

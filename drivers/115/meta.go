@@ -12,11 +12,13 @@ type Addition struct {
 	PageSize     int64   `json:"page_size" type:"number" default:"1000" help:"list api per page size of 115 driver"`
 	LimitRate    float64 `json:"limit_rate" type:"float" default:"2" help:"limit all api request rate ([limit]r/1s)"`
 	driver.RootID
-	SubTransferEnabled     bool   `json:"启用小号转存取链" type:"bool" default:"false" help:"开启后，下载/播放会先在小号转存目录中复用或秒传同名文件，再使用小号获取链接"`
-	SubCookies             string `json:"小号 Cookie" type:"text" help:"一行一个 115 小号 Cookie。配置后，播放/下载会先把文件转存到小号，再使用小号获取链接"`
-	SubFolder              string `json:"小号转存目录" default:"tmp" help:"小号网盘中用于存放转存文件的目录，会自动创建"`
-	SubFallbackToMain      bool   `json:"转存失败回退主号" type:"bool" default:"true" help:"小号不可用或转存失败时，允许继续使用主号获取链接"`
-	SubTransferCacheExpire int64  `json:"转存结果缓存时间(秒)" type:"number" default:"7200" help:"秒传/复用成功后，记住主号文件对应的小号文件，避免重复转存。不是播放直链缓存，默认 7200 秒(2 小时)"`
+	SubTransferEnabled     bool   `json:"启用小号转存取链" type:"bool" default:"false" help:"开启后，下载/播放会先秒传文件至小号，再使用小号获取链接"`
+	SubCookies             string `json:"小号 Cookie" type:"text" help:"一行一个 115 Cookie"`
+	SubFolder              string `json:"小号转存目录" default:"tmp" help:"小号网盘中用于存放秒传文件的目录"`
+	SubFallbackToMain      bool   `json:"转存失败回退主号" type:"bool" default:"true" help:"小号全部不可用时，是否允许回退到主号获取链接"`
+	SubAutoCleanupEnabled bool   `json:"启用自动清理" type:"bool" default:"true" help:"定时清理转存记录，并清理小号转存目录中过旧文件"`
+	SubAutoCleanupDays    int64  `json:"自动清理保留天数" type:"number" default:"3" help:"转存记录和小号转存目录中文件的保留天数"`
+	SubAutoCleanupCron    string `json:"自动清理运行时间" type:"text" default:"0 0 * * *" help:"cron 表达式"`
 }
 
 var config = driver.Config{

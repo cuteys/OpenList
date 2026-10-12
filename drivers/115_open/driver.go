@@ -172,17 +172,59 @@ func (d *Open115) Get(ctx context.Context, path string) (model.Obj, error) {
 	resp, err := d.client.GetFolderInfoByPath(ctx, path)
 	if err != nil {
 		if errors.Is(err, sdk.ErrObjectNotFound) {
-			return nil, errs.ObjectNotFound
+			return d.getFromParent(ctx, path, "")
 		}
 		return nil, err
 	}
-	return &Obj{
+	obj := &Obj{
 		Fid:  resp.FileID,
 		Fn:   resp.FileName,
 		Fc:   resp.FileCategory,
 		Sha1: resp.Sha1,
 		Pc:   resp.PickCode,
-	}, nil
+		FS:   resp.SizeByte,
+		Upt:  parseTime(resp.UTime),
+		UpPt: parseTime(resp.PTime),
+	}
+	if !obj.IsDir() && obj.ModTime().Unix() <= 0 {
+		return d.getFromParent(ctx, path, obj.GetID())
+	}
+	return obj, nil
+}
+
+func (d *Open115) getFromParent(ctx context.Context, path, id string) (model.Obj, error) {
+	path = stdpath.Clean(path)
+	parent, name := stdpath.Split(path)
+	parent = stdpath.Clean(parent)
+	parentID := d.GetRootId()
+	if stdpath.Clean(parent) != stdpath.Clean(d.parentPath) {
+		if err := d.WaitLimit(ctx); err != nil {
+			return nil, err
+		}
+		parentInfo, err := d.client.GetFolderInfoByPath(ctx, parent)
+		if err != nil {
+			if !errors.Is(err, sdk.ErrObjectNotFound) {
+				return nil, err
+			}
+			parentObj, err := d.getFromParent(ctx, parent, "")
+			if err != nil {
+				return nil, err
+			}
+			parentID = parentObj.GetID()
+		} else {
+			parentID = parentInfo.FileID
+		}
+	}
+	files, err := d.List(ctx, &Obj{Fid: parentID, Fc: "0"}, model.ListArgs{})
+	if err != nil {
+		return nil, err
+	}
+	for _, file := range files {
+		if (id != "" && file.GetID() == id) || (id == "" && file.GetName() == name) {
+			return file, nil
+		}
+	}
+	return nil, errs.ObjectNotFound
 }
 
 func (d *Open115) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
@@ -204,18 +246,15 @@ func (d *Open115) MakeDir(ctx context.Context, parentDir model.Obj, dirName stri
 	}, nil
 }
 
-func (d *Open115) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
+func (d *Open115) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
 	if err := d.WaitLimit(ctx); err != nil {
-		return nil, err
+		return err
 	}
 	_, err := d.client.Move(ctx, &sdk.MoveReq{
 		FileIDs: srcObj.GetID(),
 		ToCid:   dstDir.GetID(),
 	})
-	if err != nil {
-		return nil, err
-	}
-	return srcObj, nil
+	return err
 }
 
 func (d *Open115) Rename(ctx context.Context, srcObj model.Obj, newName string) (model.Obj, error) {
@@ -232,23 +271,21 @@ func (d *Open115) Rename(ctx context.Context, srcObj model.Obj, newName string) 
 	obj, ok := srcObj.(*Obj)
 	if ok {
 		obj.Fn = newName
+		return srcObj, nil
 	}
-	return srcObj, nil
+	return nil, nil
 }
 
-func (d *Open115) Copy(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
+func (d *Open115) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
 	if err := d.WaitLimit(ctx); err != nil {
-		return nil, err
+		return err
 	}
 	_, err := d.client.Copy(ctx, &sdk.CopyReq{
 		PID:     dstDir.GetID(),
 		FileID:  srcObj.GetID(),
 		NoDupli: "1",
 	})
-	if err != nil {
-		return nil, err
-	}
-	return srcObj, nil
+	return err
 }
 
 func (d *Open115) Remove(ctx context.Context, obj model.Obj) error {
